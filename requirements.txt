@@ -1,0 +1,29 @@
+# ── UI ────────────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Local LLM ─────────────────────────────────────────────────────────────────
+# Install with: pip install llama-cpp-python
+# For GPU (CUDA): CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python
+llama-cpp-python>=0.2.50
+
+# ── Embeddings ────────────────────────────────────────────────────────────────
+sentence-transformers>=2.7.0
+
+# ── Vector Search ─────────────────────────────────────────────────────────────
+faiss-cpu>=1.8.0
+# Use faiss-gpu instead if CUDA is available
+
+# ── Sparse / Keyword Retrieval ────────────────────────────────────────────────
+rank-bm25>=0.2.2
+
+# ── Fuzzy Search ──────────────────────────────────────────────────────────────
+rapidfuzz>=3.6.0
+
+# ── Data Handling ─────────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.26.0
+pyarrow>=14.0.0          # Parquet read/write support
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm>=4.66.0             # Progress bars during indexing
+scikit-learn>=1.4.0      # Cosine similarity, score normalisation
