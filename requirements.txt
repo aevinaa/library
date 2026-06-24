@@ -1,29 +1,29 @@
-# ── UI ────────────────────────────────────────────────────────────────────────
+# ── UI ──
 streamlit>=1.35.0
 
-# ── Local LLM ─────────────────────────────────────────────────────────────────
-# Install with: pip install llama-cpp-python
-# For GPU (CUDA): CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python
+# ── Local LLM (auto-downloads the GGUF on first use) ──
+# GPU build: set CMAKE_ARGS="-DGGML_CUDA=on" before installing
 llama-cpp-python>=0.2.50
+huggingface-hub>=0.23.0
 
-# ── Embeddings ────────────────────────────────────────────────────────────────
+# ── Embeddings + reranking ──
 sentence-transformers>=2.7.0
 
-# ── Vector Search ─────────────────────────────────────────────────────────────
+# ── Dense vector search ──
 faiss-cpu>=1.8.0
-# Use faiss-gpu instead if CUDA is available
 
-# ── Sparse / Keyword Retrieval ────────────────────────────────────────────────
-rank-bm25>=0.2.2
+# ── Sparse / keyword search (fast, memory-mapped) ──
+bm25s>=0.2.0
+# rank-bm25>=0.2.2     # pure-python fallback (set SPARSE_BACKEND=rank_bm25)
 
-# ── Fuzzy Search ──────────────────────────────────────────────────────────────
+# ── Fuzzy / typo correction ──
 rapidfuzz>=3.6.0
 
-# ── Data Handling ─────────────────────────────────────────────────────────────
+# ── Data ──
 pandas>=2.0.0
 numpy>=1.26.0
-pyarrow>=14.0.0          # Parquet read/write support
+pyarrow>=14.0.0
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
-tqdm>=4.66.0             # Progress bars during indexing
-scikit-learn>=1.4.0      # Cosine similarity, score normalisation
+# ── Utilities ──
+tqdm>=4.66.0
+scikit-learn>=1.4.0
