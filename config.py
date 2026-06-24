@@ -1,93 +1,59 @@
 """
-config.py — Single source of truth for all project settings.
-Both app.py and rag.py import from here. Never hardcode paths elsewhere.
+config.py
+=========
+Central configuration. Sensible defaults so the system runs with zero tuning;
+override any value with an environment variable where noted.
 """
 
-from pathlib import Path
+import os
 
-# ── Project Root ──────────────────────────────────────────────────────────────
+# ── Artefact paths ────────────────────────────────────────────────────────────
+ARTEFACT_DIR = "./index"
+CORPUS_PARQUET = os.path.join(ARTEFACT_DIR, "corpus.parquet")
+FAISS_PATH = os.path.join(ARTEFACT_DIR, "dense.faiss")
+EMB_CACHE = os.path.join(ARTEFACT_DIR, "embeddings.npy")
+BM25_DIR = os.path.join(ARTEFACT_DIR, "bm25s")        # bm25s saves a directory
+BM25_PATH = os.path.join(ARTEFACT_DIR, "bm25.pkl")    # rank_bm25 fallback pickle
+VOCAB_PATH = os.path.join(ARTEFACT_DIR, "vocab.pkl")
+HISTORY_CSV = os.path.join(ARTEFACT_DIR, "history.csv")
 
-ROOT_DIR = Path(__file__).parent.resolve()
+# ── Models ──────────────────────────────────────────────────────────────────--
+EMBED_MODEL = "all-MiniLM-L6-v2"
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# ── Data Paths ────────────────────────────────────────────────────────────────
+# Local LLM: auto-downloaded from Hugging Face on first use - no manual step.
+LLM_REPO = os.environ.get("LLM_REPO", "bartowski/Llama-3.2-3B-Instruct-GGUF")
+LLM_FILE = os.environ.get("LLM_FILE", "Llama-3.2-3B-Instruct-Q4_K_M.gguf")
+DEFAULT_LLM_PATH = os.environ.get("LLM_GGUF", "")     # explicit path overrides repo
 
-DATA_DIR            = ROOT_DIR / "data"
-RAW_CSV_PATH        = DATA_DIR / "seattle_library.csv"   # Original Kaggle dataset
-PROCESSED_CSV_PATH  = DATA_DIR / "books_clean.csv"       # Cleaned by preprocess.py
+# Optional: set LIBRARY_CSV so the app can auto-build the index on first launch.
+LIBRARY_CSV = os.environ.get("LIBRARY_CSV", "")
+BUILD_MAX_ROWS = int(os.environ.get("BUILD_MAX_ROWS", "0")) or None
 
-# ── Index Paths (built by build_index.py, gitignored) ─────────────────────────
+# ── Ingestion / indexing ──────────────────────────────────────────────────────
+READ_CHUNK_ROWS = 50_000
+EMBED_BATCH = int(os.environ.get("EMBED_BATCH", "256"))   # raise to 512/1024 on GPU
+SHOW_PROGRESS = True
 
-FAISS_INDEX_PATH    = DATA_DIR / "faiss_index.index"
-BM25_INDEX_PATH     = DATA_DIR / "bm25_corpus.pkl"
+# Sparse backend: "bm25s" (fast, memory-mapped) or "rank_bm25" (pure-python).
+SPARSE_BACKEND = os.environ.get("SPARSE_BACKEND", "bm25s")
 
-# ── Model Paths ───────────────────────────────────────────────────────────────
+# Dense index: "auto" picks flat for small corpora, HNSW for large ones.
+INDEX_TYPE = os.environ.get("INDEX_TYPE", "auto")     # "auto" | "flat" | "hnsw"
+AUTO_HNSW_THRESHOLD = 200_000
+HNSW_M = 32
+HNSW_EF_CONSTRUCTION = 200
+HNSW_EF_SEARCH = 64
 
-MODELS_DIR          = ROOT_DIR / "models"
-LLM_MODEL_PATH      = MODELS_DIR / "phi-3-mini.gguf"    # Must match filename in /models
+# ── Retrieval / ranking ───────────────────────────────────────────────────────
+RRF_K = 60
+CANDIDATE_K = 50
+FUZZY_MIN_SCORE = 82
+ABSTAIN_BELOW = 0.30
 
-# ── LLM Settings ─────────────────────────────────────────────────────────────
 
-LLM_CONTEXT_WINDOW  = 4096    # Max tokens in the model's context
-LLM_MAX_TOKENS      = 512     # Max tokens to generate per response
-LLM_TEMPERATURE     = 0.2     # Low = focused/factual; raise for creative answers
-LLM_TOP_P           = 0.9
-LLM_N_THREADS       = 8       # CPU threads for inference; match your core count
-LLM_N_GPU_LAYERS    = 0       # Set > 0 to offload layers to GPU (requires CUDA build)
-
-# ── Embedding Settings ────────────────────────────────────────────────────────
-
-EMBEDDING_MODEL     = "all-MiniLM-L6-v2"   # Fast, lightweight Sentence Transformer
-EMBEDDING_DIM       = 384                   # Must match the model above
-EMBEDDING_BATCH_SIZE = 64                   # Rows processed per batch during indexing
-
-# ── Retrieval Parameters ──────────────────────────────────────────────────────
-
-# How many candidates each retriever fetches before fusion
-TOP_K_VECTOR        = 20
-TOP_K_BM25          = 20
-
-# Final number of results returned to the LLM after reranking
-TOP_K_FINAL         = 5
-
-# Reciprocal Rank Fusion constant (higher = less aggressive rank weighting)
-RRF_K               = 60
-
-# Fuzzy search: minimum similarity score to accept a typo-corrected match (0–100)
-FUZZY_THRESHOLD     = 75
-
-# Cross-encoder model for reranking
-RERANKER_MODEL      = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
-# ── Multi-Query Expansion ─────────────────────────────────────────────────────
-
-QUERY_EXPANSION_COUNT = 2    # Number of alternative queries the LLM generates
-
-# ── Conversational Memory ─────────────────────────────────────────────────────
-
-MEMORY_WINDOW       = 6      # Number of past (user, assistant) turns to keep
-
-# ── Confidence Score Thresholds ───────────────────────────────────────────────
-
-CONFIDENCE_HIGH     = 0.75   # >= this → "High confidence"
-CONFIDENCE_MID      = 0.45   # >= this → "Moderate confidence"
-                             #  < this  → "Low confidence"
-
-# ── Analytics / Query Log ─────────────────────────────────────────────────────
-
-QUERY_LOG_PATH      = DATA_DIR / "query_log.json"
-
-# ── CSV Columns of Interest ───────────────────────────────────────────────────
-# These are the column names used from the Seattle Library dataset.
-# Update if Kaggle column names differ after preprocessing.
-
-COL_TITLE           = "Title"
-COL_AUTHOR          = "Author"
-COL_SUBJECT         = "Subjects"
-COL_ITEM_TYPE       = "ItemType"
-COL_ITEM_LOCATION   = "ItemLocation"
-COL_CALL_NUMBER     = "CallNumber"
-COL_REPORT_DATE     = "ReportDate"
-COL_AVAILABLE       = "ItemCount"
-
-# Columns combined into a single text chunk for embedding
-EMBED_COLUMNS       = [COL_TITLE, COL_AUTHOR, COL_SUBJECT, COL_ITEM_TYPE]
+def resolve_index_type(n_vectors: int) -> str:
+    """Decide the concrete FAISS index type given the corpus size."""
+    if INDEX_TYPE == "auto":
+        return "hnsw" if n_vectors >= AUTO_HNSW_THRESHOLD else "flat"
+    return INDEX_TYPE
