@@ -1,146 +1,152 @@
+"""
+rag.py
+======
+Runtime engine: hybrid retrieval (dense FAISS + sparse BM25 via a swappable
+backend, fused with RRF), fuzzy correction, cross-encoder reranking, optional
+LLM multi-query expansion and grounded answers, metadata filtering,
+availability lookup, confidence/citations, and history logging.
+
+Also holds the lazy model wrappers (Embedder, Reranker, LocalLLM, SparseIndex)
+so build_index.py can reuse them.
+"""
+
+from __future__ import annotations
+
 import os
-import re
 import csv
 import pickle
-import argparse
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
-ARTEFACT_DIR = "./index"
-CORPUS_PARQUET = os.path.join(ARTEFACT_DIR, "corpus.parquet")
-FAISS_PATH = os.path.join(ARTEFACT_DIR, "dense.faiss")
-BM25_PATH = os.path.join(ARTEFACT_DIR, "bm25.pkl")
-HISTORY_CSV = os.path.join(ARTEFACT_DIR, "history.csv")
-
-EMBED_MODEL = "all-MiniLM-L6-v2"
-RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-DEFAULT_LLM_PATH = os.environ.get("LLM_GGUF", "Llama-3.2-3B-Instruct-Q4_K_M.gguf") 
-
-READ_CHUNK_ROWS = 50_000
-EMBED_BATCH = 256
-RRF_K = 60                 
-CANDIDATE_K = 50           
-FUZZY_MIN_SCORE = 82       
-ABSTAIN_BELOW = 0.30       
-
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
-def tokenize(text: str) -> list[str]:
-    return _TOKEN_RE.findall((text or "").lower())
+import config
+from preprocess import tokenize
 
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.asarray(x, dtype=float)))
 
 
-def clean_str(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, float) and pd.isna(value):
-        return ""
-    s = str(value).strip()
-    return "" if s.lower() == "nan" else s
+def get_device() -> str:
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
 
 
-def extract_year(raw: str) -> int:
-    m = re.search(r"(1[5-9]\d{2}|20\d{2})", raw or "")
-    return int(m.group(1)) if m else 0
+def _import_bm25s():
+    try:
+        return __import__("bm25s")
+    except ImportError:
+        return None
 
-def build_corpus(csv_path: str, max_rows: int | None = None) -> pd.DataFrame:
-    """Stream the CSV, collapse to one row per BibNum, aggregating copies and
-    the set of branch locations so availability lookups actually work."""
-    agg: dict[str, dict] = {}
-    total = 0
-    reader = pd.read_csv(
-        csv_path, chunksize=READ_CHUNK_ROWS, dtype=str,
-        keep_default_na=False, on_bad_lines="skip",
-    )
-    for chunk in reader:
-        for _, row in chunk.iterrows():
-            bib = clean_str(row.get("BibNum"))
-            title = clean_str(row.get("Title"))
-            if not bib or not title:
-                continue
+
+# ── sparse backend (bm25s preferred, rank_bm25 fallback) ──────────────────────
+class SparseIndex:
+    def __init__(self, backend: str, obj, n_docs: int):
+        self.backend = backend
+        self.obj = obj
+        self.n_docs = n_docs
+
+    @classmethod
+    def build(cls, texts: list[str]) -> "SparseIndex":
+        n = len(texts)
+        if config.SPARSE_BACKEND == "bm25s":
+            bm25s = _import_bm25s()
+            if bm25s is None:
+                from rank_bm25 import BM25Okapi
+                return cls("rank_bm25", BM25Okapi([tokenize(t) for t in texts]), n)
+            r = bm25s.BM25()
+            r.index(bm25s.tokenize(texts, stopwords="en", show_progress=False),
+                    show_progress=False)
+            return cls("bm25s", r, n)
+        from rank_bm25 import BM25Okapi
+        return cls("rank_bm25", BM25Okapi([tokenize(t) for t in texts]), n)
+
+    def save(self):
+        if self.backend == "bm25s":
+            self.obj.save(config.BM25_DIR)
+        else:
+            with open(config.BM25_PATH, "wb") as f:
+                pickle.dump(self.obj, f)
+
+    @classmethod
+    def load(cls, n_docs: int) -> "SparseIndex":
+        if config.SPARSE_BACKEND == "bm25s":
+            bm25s = _import_bm25s()
+            if bm25s is None:
+                with open(config.BM25_PATH, "rb") as f:
+                    return cls("rank_bm25", pickle.load(f), n_docs)
+            return cls("bm25s", bm25s.BM25.load(config.BM25_DIR, mmap=True), n_docs)
+        with open(config.BM25_PATH, "rb") as f:
+            return cls("rank_bm25", pickle.load(f), n_docs)
+
+    def query(self, query: str, k: int) -> list[int]:
+        k = max(1, min(k, self.n_docs))
+        if self.backend == "bm25s":
+            bm25s = _import_bm25s()
+            if bm25s is None:
+                return []
             try:
-                copies = int(float(clean_str(row.get("ItemCount")) or 0))
-            except ValueError:
-                copies = 0
-            loc = clean_str(row.get("ItemLocation"))
-
-            if bib not in agg:
-                if max_rows and total >= max_rows:
-                    continue
-                agg[bib] = {
-                    "BibNum": bib,
-                    "Title": title,
-                    "Author": clean_str(row.get("Author")),
-                    "Subjects": clean_str(row.get("Subjects")),
-                    "Publisher": clean_str(row.get("Publisher")),
-                    "PublicationYear": clean_str(row.get("PublicationYear")),
-                    "Year": extract_year(clean_str(row.get("PublicationYear"))),
-                    "ItemType": clean_str(row.get("ItemType")),
-                    "Copies": 0,
-                    "_locs": set(),
-                }
-                total += 1
-            rec = agg.get(bib)
-            if rec is not None:
-                rec["Copies"] += copies
-                if loc:
-                    rec["_locs"].add(loc)
-
-    rows = []
-    for rec in agg.values():
-        locs = sorted(rec.pop("_locs"))
-        rec["Locations"] = "; ".join(locs)
-        rec["NumLocations"] = len(locs)
-       
-        rec["text"] = " ".join(p for p in (
-            rec["Title"], rec["Author"], rec["Subjects"], rec["ItemType"]
-        ) if p)
-        rows.append(rec)
-
-    df = pd.DataFrame(rows).reset_index(drop=True)
-    print(f"Corpus: {len(df):,} unique titles from the catalogue.")
-    return df
+                res, _ = self.obj.retrieve(
+                    bm25s.tokenize(query, stopwords="en", show_progress=False),
+                    k=k, show_progress=False)
+                return [int(i) for i in res[0]]
+            except Exception:
+                return []
+        scores = self.obj.get_scores(tokenize(query))
+        if not len(scores):
+            return []
+        top = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
+        top = top[np.argsort(-scores[top])]
+        return [int(i) for i in top if scores[i] > 0]
 
 
+# ── model wrappers ────────────────────────────────────────────────────────────
 class Embedder:
-    def __init__(self, model_name: str = EMBED_MODEL, device: str | None = None):
+    def __init__(self, model_name: str = config.EMBED_MODEL, device: str | None = None):
         from sentence_transformers import SentenceTransformer
-        if device is None:
-            device = "cuda" if _cuda() else "cpu"
+        device = device or get_device()
         print(f"Embedder '{model_name}' on {device}")
         self.model = SentenceTransformer(model_name, device=device)
 
-    def encode(self, texts, batch_size=EMBED_BATCH):
+    def encode(self, texts, batch_size: int = config.EMBED_BATCH):
         return self.model.encode(
             list(texts), batch_size=batch_size, convert_to_numpy=True,
-            normalize_embeddings=True, show_progress_bar=False,
+            normalize_embeddings=True, show_progress_bar=config.SHOW_PROGRESS,
         ).astype("float32")
 
 
 class Reranker:
-    def __init__(self, model_name: str = RERANK_MODEL, device: str | None = None):
+    def __init__(self, model_name: str = config.RERANK_MODEL, device: str | None = None):
         from sentence_transformers import CrossEncoder
-        if device is None:
-            device = "cuda" if _cuda() else "cpu"
-        self.model = CrossEncoder(model_name, device=device)
+        self.model = CrossEncoder(model_name, device=device or get_device())
 
     def scores(self, query: str, docs: list[str]):
         return np.asarray(self.model.predict([(query, d) for d in docs]))
 
 
 class LocalLLM:
-    """Thin wrapper over llama-cpp-python (in-process llama.cpp)."""
-    def __init__(self, model_path: str, n_ctx: int = 4096, n_gpu_layers: int = -1):
+    def __init__(self, llm):
+        self.llm = llm
+
+    @classmethod
+    def from_path(cls, path: str, n_ctx: int = 4096, n_gpu_layers: int = -1):
         from llama_cpp import Llama
-        self.llm = Llama(model_path=model_path, n_ctx=n_ctx,
-                         n_gpu_layers=n_gpu_layers, verbose=False)
+        return cls(Llama(model_path=path, n_ctx=n_ctx,
+                         n_gpu_layers=n_gpu_layers, verbose=False))
+
+    @classmethod
+    def from_repo(cls, repo: str = config.LLM_REPO, filename: str = config.LLM_FILE,
+                  n_ctx: int = 4096, n_gpu_layers: int = -1):
+        """Auto-download the GGUF from Hugging Face and load it - no manual step."""
+        from llama_cpp import Llama
+        return cls(Llama.from_pretrained(repo_id=repo, filename=filename,
+                                         n_ctx=n_ctx, n_gpu_layers=n_gpu_layers,
+                                         verbose=False))
 
     def chat(self, system: str, user: str, max_tokens: int = 512, temperature: float = 0.2):
         out = self.llm.create_chat_completion(
@@ -161,14 +167,6 @@ class LocalLLM:
             return []
 
 
-def _cuda() -> bool:
-    try:
-        import torch
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
-
-
 @dataclass
 class SearchResult:
     bibnum: str
@@ -179,112 +177,70 @@ class SearchResult:
     year: int
     copies: int
     locations: str
-    score: float                     
+    score: float
     citation: str = field(default="")
 
 
 class LibrarySearchEngine:
-    def __init__(self, corpus: pd.DataFrame, faiss_index, bm25,
-                 embedder: Embedder | None = None,
-                 reranker: Reranker | None = None,
-                 llm: LocalLLM | None = None):
+    def __init__(self, corpus, faiss_index, sparse: SparseIndex, vocab=None,
+                 embedder=None, reranker=None, llm=None):
         self.corpus = corpus
         self.index = faiss_index
-        self.bm25 = bm25
+        self.sparse = sparse
         self.embedder = embedder
         self.reranker = reranker
         self.llm = llm
-
-        self.vocab = set()
-        for col in ("Title", "Author"):
-            for txt in corpus[col].tolist():
-                self.vocab.update(tokenize(txt))
-
- 
-    @classmethod
-    def build(cls, csv_path: str, max_rows: int | None = None,
-              with_models: bool = True):
-        import faiss
-        from rank_bm25 import BM25Okapi
-        os.makedirs(ARTEFACT_DIR, exist_ok=True)
-
-        corpus = build_corpus(csv_path, max_rows=max_rows)
-        corpus.to_parquet(CORPUS_PARQUET, index=False)
-
-
-        print("Building BM25 (sparse) index ...")
-        tokenised = [tokenize(t) for t in corpus["text"].tolist()]
-        bm25 = BM25Okapi(tokenised)
-        with open(BM25_PATH, "wb") as f:
-            pickle.dump(bm25, f)
-
-        embedder = Embedder() if with_models else None
-        if embedder is not None:
-            print("Embedding documents for the dense index ...")
-            embs = embedder.encode(corpus["text"].tolist())
-            index = faiss.IndexFlatIP(embs.shape[1])   
-            index.add(embs)
-            faiss.write_index(index, FAISS_PATH)
-            print(f"Dense index: {index.ntotal:,} vectors, dim {embs.shape[1]}.")
-        else:
-            index = None
-        return cls(corpus, index, bm25, embedder=embedder)
+        if vocab is None:
+            vocab = set()
+            for col in ("Title", "Author"):
+                for t in corpus[col].tolist():
+                    vocab.update(tokenize(t))
+        self.vocab = vocab
 
     @classmethod
-    def load(cls, llm_path: str | None = None, with_rerank: bool = True):
+    def load(cls, with_rerank: bool = True, enable_llm: bool = False):
         import faiss
-        corpus = pd.read_parquet(CORPUS_PARQUET)
-        index = faiss.read_index(FAISS_PATH)
-        with open(BM25_PATH, "rb") as f:
-            bm25 = pickle.load(f)
+        corpus = pd.read_parquet(config.CORPUS_PARQUET)
+        index = faiss.read_index(config.FAISS_PATH)
+        sparse = SparseIndex.load(len(corpus))
+        vocab = None
+        if os.path.exists(config.VOCAB_PATH):
+            with open(config.VOCAB_PATH, "rb") as f:
+                vocab = pickle.load(f)
         embedder = Embedder()
         reranker = Reranker() if with_rerank else None
-        llm = None
-        path = llm_path or DEFAULT_LLM_PATH
-        if path and os.path.exists(path):
-            llm = LocalLLM(path)
-        return cls(corpus, index, bm25, embedder=embedder,
-                   reranker=reranker, llm=llm)
+        llm = build_llm() if enable_llm else None
+        return cls(corpus, index, sparse, vocab=vocab,
+                   embedder=embedder, reranker=reranker, llm=llm)
 
-
+    # ---- retrieval --------------------------------------------------------
     def _dense(self, query: str, k: int) -> list[int]:
         emb = self.embedder.encode([query])
         _, idx = self.index.search(emb, k)
         return [int(i) for i in idx[0] if i >= 0]
 
-    def _sparse(self, query: str, k: int) -> list[int]:
-        scores = self.bm25.get_scores(tokenize(query))
-        if not len(scores):
-            return []
-        top = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
-        top = top[np.argsort(-scores[top])]
-        return [int(i) for i in top if scores[i] > 0]
-
     @staticmethod
-    def _rrf(ranked_lists: list[list[int]]) -> list[tuple[int, float]]:
-        """Reciprocal Rank Fusion across any number of ranked position lists."""
+    def _rrf(ranked_lists):
         fused: dict[int, float] = {}
         for lst in ranked_lists:
             for rank, pos in enumerate(lst):
-                fused[pos] = fused.get(pos, 0.0) + 1.0 / (RRF_K + rank + 1)
+                fused[pos] = fused.get(pos, 0.0) + 1.0 / (config.RRF_K + rank + 1)
         return sorted(fused.items(), key=lambda kv: -kv[1])
 
-
-    def correct_query(self, query: str) -> tuple[str, bool]:
+    def correct_query(self, query: str):
         from rapidfuzz import process, fuzz
         out, changed = [], False
         for tok in tokenize(query):
             if tok in self.vocab or len(tok) <= 3:
-                out.append(tok)
-                continue
+                out.append(tok); continue
             match = process.extractOne(tok, self.vocab, scorer=fuzz.ratio)
-            if match and match[1] >= FUZZY_MIN_SCORE:
+            if match and match[1] >= config.FUZZY_MIN_SCORE:
                 out.append(match[0]); changed = True
             else:
                 out.append(tok)
         return " ".join(out), changed
 
-    def _apply_filters(self, idxs: list[int], filters: dict) -> list[int]:
+    def _apply_filters(self, idxs, filters):
         if not filters:
             return idxs
         sub = self.corpus.iloc[idxs]
@@ -303,10 +259,9 @@ class LibrarySearchEngine:
 
     def search(self, query: str, k: int = 10, filters: dict | None = None,
                use_rerank: bool = True, use_multiquery: bool = False,
-               candidate_k: int = CANDIDATE_K, log: bool = True):
+               candidate_k: int = config.CANDIDATE_K, log: bool = True):
         t0 = datetime.now()
         corrected, changed = self.correct_query(query)
-
         queries = [corrected]
         if use_multiquery and self.llm is not None:
             queries += self.llm.expand_queries(corrected)
@@ -314,28 +269,24 @@ class LibrarySearchEngine:
         ranked_lists = []
         for q in queries:
             ranked_lists.append(self._dense(q, candidate_k))
-            ranked_lists.append(self._sparse(q, candidate_k))
+            ranked_lists.append(self.sparse.query(q, candidate_k))
         fused = self._rrf(ranked_lists)
         idxs = [pos for pos, _ in fused]
         fused_score = {pos: s for pos, s in fused}
-
         idxs = self._apply_filters(idxs, filters)[: max(candidate_k, k)]
 
         if use_rerank and self.reranker is not None and idxs:
-            docs = self.corpus.iloc[idxs]["text"].tolist()
-            rr = self.reranker.scores(corrected, docs)
+            rr = self.reranker.scores(corrected, self.corpus.iloc[idxs]["text"].tolist())
             conf = sigmoid(rr)
             order = np.argsort(-rr)
             idxs = [idxs[i] for i in order]
             scores = [float(conf[i]) for i in order]
+        elif idxs:
+            raw = np.array([fused_score.get(p, 0.0) for p in idxs])
+            lo, hi = raw.min(), raw.max()
+            scores = list((raw - lo) / (hi - lo + 1e-9))
         else:
-
-            if idxs:
-                raw = np.array([fused_score.get(p, 0.0) for p in idxs])
-                lo, hi = raw.min(), raw.max()
-                scores = list((raw - lo) / (hi - lo + 1e-9))
-            else:
-                scores = []
+            scores = []
 
         results = []
         for pos, sc in list(zip(idxs, scores))[:k]:
@@ -347,52 +298,38 @@ class LibrarySearchEngine:
                 locations=r["Locations"], score=round(float(sc), 3),
                 citation=f"[BibNum {r['BibNum']}]",
             ))
-
-        meta = {
-            "original": query,
-            "corrected": corrected,
-            "typo_fixed": changed,
-            "confidence": results[0].score if results else 0.0,
-            "latency_ms": int((datetime.now() - t0).total_seconds() * 1000),
-            "n_results": len(results),
-        }
+        meta = {"original": query, "corrected": corrected, "typo_fixed": changed,
+                "confidence": results[0].score if results else 0.0,
+                "latency_ms": int((datetime.now() - t0).total_seconds() * 1000),
+                "n_results": len(results)}
         if log:
             self._log(meta)
         return results, meta
 
     def lookup_availability(self, title_query: str):
         from rapidfuzz import process, fuzz
-        titles = self.corpus["Title"].tolist()
-        match = process.extractOne(title_query, titles, scorer=fuzz.WRatio)
+        match = process.extractOne(title_query, self.corpus["Title"].tolist(),
+                                   scorer=fuzz.WRatio)
         if not match or match[1] < 60:
             return None
         row = self.corpus.iloc[match[2]]
-        return {
-            "title": row["Title"], "author": row["Author"],
-            "copies": int(row["Copies"]),
-            "locations": row["Locations"].split("; ") if row["Locations"] else [],
-            "match_score": round(match[1] / 100, 2),
-        }
+        return {"title": row["Title"], "author": row["Author"],
+                "copies": int(row["Copies"]),
+                "locations": row["Locations"].split("; ") if row["Locations"] else [],
+                "match_score": round(match[1] / 100, 2)}
 
-    def answer(self, query: str, results: list[SearchResult],
-               meta: dict, history: list | None = None) -> str:
+    def answer(self, query, results, meta, history=None):
         if not results:
             return "I could not find anything matching that in the catalogue."
-        if meta["confidence"] < ABSTAIN_BELOW:
-            note = ("I am not very confident about this - the closest matches "
-                    "are weak, so treat these as guesses:\n")
-        else:
-            note = ""
-
+        note = ("" if meta["confidence"] >= config.ABSTAIN_BELOW else
+                "I am not very confident - the closest matches are weak, so "
+                "treat these as guesses:\n")
         context = "\n".join(
             f"{r.citation} '{r.title}' by {r.author or 'unknown'} "
             f"({r.item_type}, {r.year}). Subjects: {r.subjects or 'n/a'}. "
-            f"Copies: {r.copies}, branches: {r.locations or 'n/a'}."
-            for r in results
-        )
+            f"Copies: {r.copies}, branches: {r.locations or 'n/a'}." for r in results)
         if self.llm is None:
-            return note + context 
-
+            return note + context
         sys = ("You are a library assistant. Answer using ONLY the catalogue "
                "entries provided. Cite the BibNum in square brackets after any "
                "book you mention. If the entries do not answer the question, "
@@ -401,13 +338,12 @@ class LibrarySearchEngine:
         if history:
             convo = "Earlier turns:\n" + "\n".join(
                 f"{h['role']}: {h['content']}" for h in history[-4:]) + "\n\n"
-        user = f"{convo}Catalogue entries:\n{context}\n\nQuestion: {query}"
-        return note + self.llm.chat(sys, user)
+        return note + self.llm.chat(sys, f"{convo}Catalogue entries:\n{context}\n\nQuestion: {query}")
 
-    def _log(self, meta: dict):
-        os.makedirs(ARTEFACT_DIR, exist_ok=True)
-        new = not os.path.exists(HISTORY_CSV)
-        with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
+    def _log(self, meta):
+        os.makedirs(config.ARTEFACT_DIR, exist_ok=True)
+        new = not os.path.exists(config.HISTORY_CSV)
+        with open(config.HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if new:
                 w.writerow(["ts", "query", "corrected", "typo_fixed",
@@ -417,18 +353,8 @@ class LibrarySearchEngine:
                         meta["latency_ms"], meta["n_results"]])
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Build the hybrid library index")
-    ap.add_argument("--csv", required=True)
-    ap.add_argument("--build", action="store_true")
-    ap.add_argument("--max-rows", type=int, default=None)
-    args = ap.parse_args()
-    if args.build:
-        LibrarySearchEngine.build(args.csv, max_rows=args.max_rows)
-        print("Index built in", ARTEFACT_DIR)
-    else:
-        print("Nothing to do. Pass --build to index.")
-
-
-if __name__ == "__main__":
-    main()
+def build_llm():
+    """Resolve a local LLM: explicit path if given, else auto-download by repo."""
+    if config.DEFAULT_LLM_PATH and os.path.exists(config.DEFAULT_LLM_PATH):
+        return LocalLLM.from_path(config.DEFAULT_LLM_PATH)
+    return LocalLLM.from_repo()
