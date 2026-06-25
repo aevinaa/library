@@ -22,13 +22,16 @@ runs locally.
 5. [Installation](#installation)
 6. [Getting the dataset](#getting-the-dataset)
 7. [Building the index](#building-the-index)
-8. [Running the app](#running-the-app)
-9. [One-command launch (auto-build)](#one-command-launch-auto-build)
-10. [Integrating a local LLM](#integrating-a-local-llm)
-11. [Configuration reference](#configuration-reference)
-12. [Efficiency and scaling](#efficiency-and-scaling)
-13. [Troubleshooting](#troubleshooting)
-14. [Extending the project](#extending-the-project)
+8. [Rebuilding the index (important)](#rebuilding-the-index-important)
+9. [Running the app](#running-the-app)
+10. [One-command launch (auto-build)](#one-command-launch-auto-build)
+11. [Integrating a local LLM](#integrating-a-local-llm)
+12. [Understanding the confidence score](#understanding-the-confidence-score)
+13. [Configuration reference](#configuration-reference)
+14. [Efficiency and scaling](#efficiency-and-scaling)
+15. [Troubleshooting](#troubleshooting)
+16. [Project history and key changes](#project-history-and-key-changes)
+17. [Extending the project](#extending-the-project)
 
 ---
 
@@ -40,10 +43,10 @@ runs locally.
 | Keyword search | BM25 via `bm25s` (fast, memory-mapped) |
 | Hybrid search | Reciprocal Rank Fusion (RRF) of the dense and sparse rankings |
 | Fuzzy / typo correction | `rapidfuzz` repairs query tokens against the corpus vocabulary |
-| Cross-encoder reranking | a cross-encoder re-scores the fused candidates for precision |
+| Cross-encoder reranking | a cross-encoder re-scores a sentence-like rendering of the candidates |
 | Multi-query expansion | the local LLM paraphrases your query; all variants are searched and fused |
 | Metadata filtering | author, subject, item type, and year-range filters on the catalogue |
-| Availability & location | copies and branches are aggregated per title during ingest |
+| Availability & location | BM25 lookup with a token-coverage gate; copies and branches aggregated per title |
 | Source citations + confidence | every result carries a `[BibNum ...]` citation and a 0-1 confidence score |
 | Conversational memory | prior turns are threaded into the answer prompt |
 | Search history & analytics | every query is logged and summarised in an analytics tab |
@@ -78,11 +81,17 @@ stage.
 2. It is searched against both the **dense** (FAISS) and **sparse** (BM25)
    indices; the two rankings are merged with **RRF**.
 3. Optional **metadata filters** are applied.
-4. The top candidates are **reranked** by the cross-encoder.
+4. The top candidates are **reranked** by the cross-encoder, which scores a
+   sentence-like rendering of each record ("Title. by Author. about Subjects.").
 5. A **confidence** score is derived from the top result; below a threshold the
    answer is flagged as uncertain.
 6. The results, with **citations**, are passed to the local LLM for a grounded
    answer (or returned as a clean list if no LLM is enabled).
+
+**Availability lookup** is a separate path: it queries the BM25 index for the
+title and then requires that most of the query's words actually appear in the
+matched title (a token-coverage gate). If they do not, it reports "not found"
+rather than returning the closest unrelated title.
 
 ---
 
@@ -99,7 +108,7 @@ RagAgent/
 ├── inventory.csv      # the catalogue (you download this)
 └── index/             # generated artefacts (created by build_index.py)
     ├── corpus.parquet
-    ├── bm25s/
+    ├── bm25s/         # bm25s sparse index (a directory of files)
     ├── vocab.pkl
     ├── embeddings.npy
     ├── dense.faiss
@@ -183,7 +192,37 @@ python build_index.py --csv inventory.csv
 ```
 
 On the full set the dense index switches to HNSW automatically, so queries stay
-fast.
+fast. The full dataset also makes results noticeably better than the 50k slice,
+because popular titles are actually present rather than missing.
+
+---
+
+## Rebuilding the index (important)
+
+The artefacts on disk are tied to the code and settings that produced them. **If
+you change any of the following, delete the `index/` folder and rebuild:**
+
+- the indexing code (`preprocess.py` or `build_index.py`),
+- the sparse backend (`SPARSE_BACKEND`),
+- the embedding model (`EMBED_MODEL`),
+- or the dataset itself.
+
+```powershell
+Remove-Item -Recurse -Force index
+python build_index.py --csv inventory.csv --max-rows 50000
+```
+
+The one exception is the **dense index type** (`flat` vs `hnsw`): that can be
+reshaped from the cached embeddings without re-embedding:
+
+```powershell
+$env:INDEX_TYPE = "hnsw"
+python build_index.py --reindex
+```
+
+If you skip a needed rebuild, the app may fail to load the index - for example
+with a missing `bm25s/params.index.json` after switching the sparse backend. The
+fix is always to rebuild.
 
 ---
 
@@ -229,7 +268,9 @@ streamlit run app.py
 ```
 
 The app detects the missing index, builds it with a progress spinner, then runs
-normally. On later launches it simply loads the existing index.
+normally. On later launches it simply loads the existing index. (Note: this only
+triggers when the index is *absent*; a *stale* index still needs a manual
+rebuild as above.)
 
 ---
 
@@ -324,6 +365,34 @@ per session.
 
 ---
 
+## Understanding the confidence score
+
+The confidence shown next to each answer is `sigmoid(cross-encoder score)` for
+the top result. It is common to see **low numbers even when the top result is
+correct**, and that is mostly a calibration artefact, not a sign of bad
+retrieval:
+
+- The cross-encoder (`ms-marco-MiniLM-L-6-v2`) was trained to judge
+  natural-language queries against **prose passages**. Library records are terse
+  (a title and a few keywords), so the model assigns modest scores even to the
+  right book, and the sigmoid pushes those low.
+- The **ranking** is still reliable; only the absolute number is pessimistic.
+
+Ways to improve it, in order of effort:
+
+1. **Already done:** the reranker now scores a sentence-like rendering of each
+   record instead of a raw keyword blob, which lifts scores for true matches.
+2. **Use a stronger reranker** (query-time only, no rebuild): change
+   `RERANK_MODEL` in `config.py` to `cross-encoder/ms-marco-MiniLM-L-12-v2` or a
+   BGE reranker such as `BAAI/bge-reranker-base`, then relaunch.
+3. **Build the full dataset.** On the 50k slice the best available match is often
+   genuinely mediocre because the ideal record is missing; with the full data,
+   confidence rises.
+4. If you only want fewer "uncertain" notices, lower `ABSTAIN_BELOW` in
+   `config.py` - but prefer fixing the signal over moving the threshold.
+
+---
+
 ## Configuration reference
 
 Everything lives in `config.py` and most values can be overridden with
@@ -340,10 +409,10 @@ environment variables.
 | `SPARSE_BACKEND` | `bm25s` | `bm25s` (fast) or `rank_bm25` (pure-python fallback) |
 | `INDEX_TYPE` | `auto` | `auto` / `flat` (exact) / `hnsw` (approximate, fast at scale) |
 
-Other tunables in `config.py` (not env-driven by default): `RRF_K` (fusion
-constant), `CANDIDATE_K` (candidates pulled before reranking), `FUZZY_MIN_SCORE`
-(typo-correction threshold), `ABSTAIN_BELOW` (confidence floor), and the HNSW
-graph parameters.
+Other tunables in `config.py` (not env-driven by default): `RERANK_MODEL`,
+`RRF_K` (fusion constant), `CANDIDATE_K` (candidates pulled before reranking),
+`FUZZY_MIN_SCORE` (typo-correction threshold), `ABSTAIN_BELOW` (confidence
+floor), and the HNSW graph parameters.
 
 ---
 
@@ -351,19 +420,13 @@ graph parameters.
 
 - **Sparse search** uses `bm25s`, which is far faster than `rank-bm25` and loads
   its index memory-mapped, so it barely touches your heap. To fall back, set
-  `SPARSE_BACKEND=rank_bm25` (and uncomment `rank-bm25` in `requirements.txt`).
+  `SPARSE_BACKEND=rank_bm25` (and uncomment `rank-bm25` in `requirements.txt`),
+  then rebuild.
 - **Dense index type** is chosen automatically: exact `flat` for small corpora,
   approximate `HNSW` once you pass ~200k titles, which keeps queries fast into
   the millions while staying on CPU.
-- **Embeddings are cached** to `index/embeddings.npy`. You can rebuild the FAISS
-  structure (for example to force a different index type) **without
-  re-embedding**:
-
-  ```powershell
-  $env:INDEX_TYPE = "hnsw"
-  python build_index.py --reindex
-  ```
-
+- **Embeddings are cached** to `index/embeddings.npy`, so you can reshape the
+  FAISS index (`--reindex`) without re-embedding.
 - **The GPU helps the embedding step most**, not FAISS. Confirm
   `torch.cuda.is_available()` is `True` (install the CUDA build of PyTorch) and
   raise `EMBED_BATCH` to 512-1024. Installing `faiss-gpu` is rarely worth the
@@ -387,6 +450,11 @@ The import is resolving to a different `preprocess` package installed elsewhere
 `ren preprocess.py data_prep.py`, then change `from preprocess import ...` to
 `from data_prep import ...` in both `build_index.py` and `rag.py`.
 
+**`FileNotFoundError: ... index\bm25s\params.index.json` (or similar on load)**
+Your index on disk is **stale** - it was built by older code or a different
+`SPARSE_BACKEND` than the current one. Delete and rebuild:
+`Remove-Item -Recurse -Force index` then `python build_index.py --csv inventory.csv --max-rows 50000`.
+
 **The build "just sits there" with no output**
 It is almost always the first-run model download followed by the silent
 embedding step. Give it a few minutes. To confirm progress, watch the artefacts
@@ -398,6 +466,12 @@ near-instant run.
 Your PyTorch is the CPU-only build. Install the CUDA build from
 `pytorch.org/get-started/locally` into the same interpreter, then verify with
 `python -c "import torch; print(torch.cuda.is_available())"`.
+
+**An availability lookup returns the wrong book**
+That was the old `rapidfuzz.WRatio` behaviour; the current code uses BM25 with a
+token-coverage gate and returns "not found" for titles that are not in the
+index. If you still see a wrong result, the title is probably not in your slice
+- build the full dataset.
 
 **`streamlit` is not recognised**
 Install it (`python -m pip install streamlit`) or launch via
@@ -414,6 +488,123 @@ Use `hf` instead - same arguments, e.g.
 
 ---
 
+## Project history and key changes
+
+A detailed account of how the project evolved and why each major decision was
+made. Read top to bottom to understand how the current design came about.
+
+### 1. Initial prototype - simple RAG
+
+The project began as a minimal Retrieval-Augmented Generation demo over a small
+(~200-row) library CSV. Each row was turned into a natural-language document,
+embedded with sentence-transformers, stored in **ChromaDB**, and answered with
+the **Anthropic API**. This established the core loop: embed, store, retrieve
+top-k, generate a grounded answer. The first lesson recorded here was that pure
+semantic search is the *weakest* single approach for a catalogue, because users
+search exact titles, authors, and ISBNs where keyword matching wins.
+
+### 2. Scaling to the Seattle dataset (~2.5M rows)
+
+Moving to the full Seattle "Library Collection Inventory" broke the naive
+approach (you cannot load millions of rows into memory or embed them in one
+pass). Changes introduced:
+
+- **Streaming ingestion** - the CSV is read in bounded chunks so memory stays
+  flat regardless of file size.
+- **Per-title de-duplication** - a single title (BibNum) appears once per branch
+  that holds it, so the data is collapsed to one document per title to avoid
+  embedding the same book dozens of times.
+- **Batched embedding, GPU auto-detection, and resumable indexing** (skip ids
+  already stored so a crash mid-build does not mean starting over).
+- Fixed ChromaDB's **"too many SQL variables"** error by batching the
+  existence-check lookups instead of passing tens of thousands of ids at once.
+
+### 3. From cloud to local generation (llama.cpp)
+
+The generation step was moved off the Anthropic API onto a **local LLM** via
+`llama.cpp`. A key clarification captured here: `llama.cpp` is an *inference
+engine* (it does embeddings and generation), not a vector store, so it pairs
+with - rather than replaces - the retrieval stack. For a single-machine app,
+`llama-cpp-python` (in-process) was chosen over running a separate server.
+
+### 4. Full feature set and re-architecture
+
+The biggest leap. The eleven target features were implemented and the stack was
+re-architected to support them:
+
+- **ChromaDB → FAISS** for dense vectors, plus **rank-bm25** for sparse keyword
+  search, fused with **Reciprocal Rank Fusion (RRF)**.
+- **rapidfuzz** for typo correction, a **cross-encoder** for reranking,
+  **multi-query expansion** via the LLM, **metadata filtering**, **conversational
+  memory**, **citations + confidence**, and **search history/analytics**.
+- **Parquet** for the corpus store and a **Streamlit** UI.
+- **Per-title aggregation** - copies are summed and branch locations collected
+  per title during ingest, which is what makes availability and location lookups
+  meaningful.
+
+### 5. Modular split
+
+The single engine file was split into the four-module layout requested:
+`config.py` (settings), `preprocess.py` (data layer), `build_index.py` (offline
+indexer), and `rag.py` (runtime engine), with `app.py` as the UI. The import
+graph is acyclic: `build_index → rag → preprocess → config`.
+
+### 6. Efficiency pass
+
+- **Embedding cache** (`embeddings.npy`) so the FAISS index can be rebuilt
+  without re-embedding.
+- **flat vs HNSW** dense index, with a `--reindex` command to switch between them
+  from the cache.
+- **Precomputed vocabulary** at build time (no scanning millions of titles at
+  startup) and **compact column dtypes** for a smaller, faster Parquet.
+
+### 7. "Easy and efficient" pass
+
+- **rank-bm25 → bm25s**: a far faster, memory-mapped sparse backend, placed
+  behind a swappable `SPARSE_BACKEND` setting.
+- **Automatic LLM download** via `from_pretrained` - no manual GGUF download and
+  no environment variable required; just a sidebar toggle.
+- **Automatic flat/HNSW selection** by corpus size, and **auto-build on first
+  launch** when `LIBRARY_CSV` is set, with a clear message when the index is
+  missing.
+- Added a quickstart **README** and a consolidated **requirements.txt**.
+
+### 8. Availability lookup fix (the mismatch bug)
+
+Searching "Prisoner of Azkaban" returned an unrelated title at "85% match". Two
+causes were diagnosed: `rapidfuzz.WRatio` over-scores incidental overlap with
+long titles, and the title was not in the 50k slice at all. The fix routed
+availability through the **BM25 index** plus a **query-token coverage gate**, so
+a title that is not in the catalogue now returns "not found" instead of a
+confident wrong answer. A `query_scored` method was added to the sparse index to
+expose relevance scores.
+
+### 9. Confidence calibration
+
+Explained that consistently low confidence is a **calibration artefact** - the
+cross-encoder is trained on prose, while catalogue records are terse - and not a
+sign of bad ranking. The reranker was changed to score a **sentence-like
+rendering** of each record to lift true-match scores, and the README documents
+swapping to a stronger reranker via `RERANK_MODEL` and tuning `ABSTAIN_BELOW`.
+
+### 10. Operational fixes and lessons
+
+Smaller but real issues resolved along the way, recorded so they do not recur:
+
+- `[optional]` brackets in instructions are notation, not literal arguments.
+- Install into the same interpreter with `python -m pip` to avoid "installed but
+  not found".
+- Launch the UI with `streamlit run app.py`, not `python app.py`.
+- Install the **CUDA builds** of PyTorch (and optionally `llama-cpp-python`) for
+  GPU speed; `faiss-gpu` is rarely worth the install pain on Windows.
+- The Hugging Face CLI was renamed from `huggingface-cli` to `hf`.
+- A local `preprocess.py` can be shadowed by an installed package of the same
+  name; rename to `data_prep.py` if so.
+- Artefacts are tied to the code that wrote them - **rebuild after changing the
+  backend, models, or indexing code** (the stale-index rule above).
+
+---
+
 ## Extending the project
 
 - **Evaluation harness** (`eval.py`): measure recall@k and MRR on a set of
@@ -426,3 +617,5 @@ Use `hf` instead - same arguments, e.g.
   without a full rebuild.
 - **Faster reranking**: lower `CANDIDATE_K` or use an ONNX-quantised
   cross-encoder if query latency matters.
+- **Blended confidence**: combine the reranker score with the dense cosine
+  similarity for a more intuitive 0-1 range.
